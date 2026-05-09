@@ -96,67 +96,103 @@ async function searchPersons(query) {
 }
 
 async function fetchUpcomingComps(wcaId) {
-  // Step 1: fetch upcoming comps that use WCA registration (announced/ongoing)
   const today = new Date().toISOString().split('T')[0]
-  // Fetch up to 100 upcoming comps with open/upcoming registration
-  const res = await fetch(`${WCA_BASE}/competitions?start=${today}&per_page=100&sort=start_date`)
-  if (!res.ok) throw new Error('Failed to fetch competitions')
-  const data = await res.json()
-  const allComps = Array.isArray(data) ? data : (data.competitions || [])
+  const end = new Date()
+  end.setMonth(end.getMonth() + 6)
+  const endStr = end.toISOString().split('T')[0]
 
-  // Step 2: for each comp, check WCIF to see if this person is accepted
-  // We do this concurrently but throttle to avoid hammering the API
-  const CHUNK = 10
-  const registered = []
+  // Step 1: Fetch all upcoming comps in date range across multiple pages
+  const allComps = []
+  let page = 1
+  while (true) {
+    const res = await fetch(`${WCA_BASE}/competitions?start=${today}&end=${endStr}&per_page=100&page=${page}`)
+    if (!res.ok) break
+    const data = await res.json()
+    const comps = Array.isArray(data) ? data : (data.competitions || [])
+    if (!comps.length) break
+    allComps.push(...comps)
+    if (comps.length < 100) break
+    page++
+  }
+
+  if (!allComps.length) return []
+
+  // Step 2: For each comp, hit /registrations (lightweight) to check if person is accepted
+  const CHUNK = 8
+  const matchedComps = []
 
   for (let i = 0; i < allComps.length; i += CHUNK) {
     const chunk = allComps.slice(i, i + CHUNK)
     const results = await Promise.all(
       chunk.map(async comp => {
         try {
-          const wcifRes = await fetch(`${WCA_BASE}/competitions/${comp.id}/wcif/public`)
-          if (!wcifRes.ok) return null
-          const wcif = await wcifRes.json()
-          const person = (wcif.persons || []).find(
-            p => p.wcaId === wcaId && p.registration?.status === 'accepted'
+          const regRes = await fetch(`${WCA_BASE}/competitions/${comp.id}/registrations`)
+          if (!regRes.ok) return null
+          const regs = await regRes.json()
+          const myReg = (Array.isArray(regs) ? regs : []).find(
+            r => r.wca_id === wcaId && r.competing?.registration_status === 'accepted'
           )
-          if (!person) return null
-
-          // Get timezone
-          const timezone = wcif.schedule?.venues?.[0]?.timezone || 'UTC'
-
-          // Get first activity start time
-          let firstStart = null
-          for (const venue of (wcif.schedule?.venues || [])) {
-            for (const room of (venue.rooms || [])) {
-              for (const activity of (room.activities || [])) {
-                if (!firstStart || new Date(activity.startTime) < new Date(firstStart)) {
-                  firstStart = activity.startTime
-                }
-                for (const child of (activity.childActivities || [])) {
-                  if (!firstStart || new Date(child.startTime) < new Date(firstStart)) {
-                    firstStart = child.startTime
-                  }
-                }
-              }
-            }
-          }
-
-          return {
-            comp,
-            wcifInfo: {
-              eventIds: person.registration?.eventIds || [],
-              firstStart,
-              timezone,
-            }
-          }
+          if (!myReg) return null
+          return { comp, myReg }
         } catch {
           return null
         }
       })
     )
-    results.filter(Boolean).forEach(r => registered.push(r))
+    results.filter(Boolean).forEach(r => matchedComps.push(r))
   }
+
+  if (!matchedComps.length) return []
+
+  // Step 3: For matched comps only, fetch WCIF for schedule + exact events
+  const registered = await Promise.all(
+    matchedComps.map(async ({ comp, myReg }) => {
+      try {
+        const wcifRes = await fetch(`${WCA_BASE}/competitions/${comp.id}/wcif/public`)
+        if (!wcifRes.ok) {
+          return {
+            comp,
+            wcifInfo: {
+              eventIds: myReg.competing?.event_ids || [],
+              firstStart: null,
+              timezone: 'UTC',
+            }
+          }
+        }
+        const wcif = await wcifRes.json()
+        const timezone = wcif.schedule?.venues?.[0]?.timezone || 'UTC'
+        const person = (wcif.persons || []).find(p => p.wcaId === wcaId)
+        const eventIds = person?.registration?.eventIds || myReg.competing?.event_ids || []
+
+        let firstStart = null
+        for (const venue of (wcif.schedule?.venues || [])) {
+          for (const room of (venue.rooms || [])) {
+            for (const activity of (room.activities || [])) {
+              if (!firstStart || new Date(activity.startTime) < new Date(firstStart)) {
+                firstStart = activity.startTime
+              }
+              for (const child of (activity.childActivities || [])) {
+                if (!firstStart || new Date(child.startTime) < new Date(firstStart)) {
+                  firstStart = child.startTime
+                }
+              }
+            }
+          }
+        }
+
+        return { comp, wcifInfo: { eventIds, firstStart, timezone } }
+      } catch {
+        return {
+          comp,
+          wcifInfo: {
+            eventIds: myReg.competing?.event_ids || [],
+            firstStart: null,
+            timezone: 'UTC',
+          }
+        }
+      }
+    })
+  )
 
   return registered.sort((a, b) => new Date(a.comp.start_date) - new Date(b.comp.start_date))
 }
