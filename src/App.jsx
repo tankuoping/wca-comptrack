@@ -84,18 +84,26 @@ async function searchPersons(query) {
     if (!res.ok) throw new Error(`No profile found for "${query.toUpperCase()}"`)
     const data = await res.json()
     const p = data.person
-    return [{ wca_id: p.wca_id, name: p.name, country_iso2: p.country_iso2 }]
+    // Also fetch user_id via search since /persons doesn't return it
+    const userRes = await fetch(`${WCA_BASE}/search/users?q=${encodeURIComponent(query.toUpperCase())}&persons_table=true`)
+    let userId = null
+    if (userRes.ok) {
+      const userData = await userRes.json()
+      const match = (userData.result || []).find(u => u.wca_id === p.wca_id)
+      userId = match?.id || null
+    }
+    return [{ wca_id: p.wca_id, name: p.name, country_iso2: p.country_iso2, user_id: userId }]
   } else {
     const res = await fetch(`${WCA_BASE}/search/users?q=${encodeURIComponent(query)}&persons_table=true`)
     if (!res.ok) throw new Error('Search failed')
     const data = await res.json()
     const users = (data.result || []).filter(u => u.wca_id)
     if (!users.length) throw new Error(`No competitors found for "${query}"`)
-    return users.map(u => ({ wca_id: u.wca_id, name: u.name, country_iso2: u.country_iso2 }))
+    return users.map(u => ({ wca_id: u.wca_id, name: u.name, country_iso2: u.country_iso2, user_id: u.id }))
   }
 }
 
-async function fetchUpcomingComps(wcaId) {
+async function fetchUpcomingComps(wcaId, userId) {
   const today = new Date().toISOString().split('T')[0]
   const end = new Date()
   end.setMonth(end.getMonth() + 6)
@@ -129,8 +137,9 @@ async function fetchUpcomingComps(wcaId) {
           const regRes = await fetch(`${WCA_BASE}/competitions/${comp.id}/registrations`)
           if (!regRes.ok) return null
           const regs = await regRes.json()
+          // Registrations use user_id, not wca_id
           const myReg = (Array.isArray(regs) ? regs : []).find(
-            r => r.wca_id === wcaId && r.competing?.registration_status === 'accepted'
+            r => r.user_id === userId
           )
           if (!myReg) return null
           return { comp, myReg }
@@ -153,7 +162,7 @@ async function fetchUpcomingComps(wcaId) {
           return {
             comp,
             wcifInfo: {
-              eventIds: myReg.competing?.event_ids || [],
+              eventIds: myReg.event_ids || [],
               firstStart: null,
               timezone: 'UTC',
             }
@@ -162,7 +171,7 @@ async function fetchUpcomingComps(wcaId) {
         const wcif = await wcifRes.json()
         const timezone = wcif.schedule?.venues?.[0]?.timezone || 'UTC'
         const person = (wcif.persons || []).find(p => p.wcaId === wcaId)
-        const eventIds = person?.registration?.eventIds || myReg.competing?.event_ids || []
+        const eventIds = person?.registration?.eventIds || myReg.event_ids || []
 
         let firstStart = null
         for (const venue of (wcif.schedule?.venues || [])) {
@@ -185,7 +194,7 @@ async function fetchUpcomingComps(wcaId) {
         return {
           comp,
           wcifInfo: {
-            eventIds: myReg.competing?.event_ids || [],
+            eventIds: myReg.event_ids || [],
             firstStart: null,
             timezone: 'UTC',
           }
@@ -532,7 +541,7 @@ export default function App() {
     setCompsLoading(true)
     setProgress(30)
     try {
-      const results = await fetchUpcomingComps(person.wca_id)
+      const results = await fetchUpcomingComps(person.wca_id, person.user_id)
       setProgress(100)
       setComps(results)
     } catch (e) {
