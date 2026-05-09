@@ -96,50 +96,69 @@ async function searchPersons(query) {
 }
 
 async function fetchUpcomingComps(wcaId) {
+  // Step 1: fetch upcoming comps that use WCA registration (announced/ongoing)
   const today = new Date().toISOString().split('T')[0]
-  const res = await fetch(`${WCA_BASE}/competitions?competitor_for=${wcaId}&start=${today}&per_page=50`)
+  // Fetch up to 100 upcoming comps with open/upcoming registration
+  const res = await fetch(`${WCA_BASE}/competitions?start=${today}&per_page=100&sort=start_date`)
   if (!res.ok) throw new Error('Failed to fetch competitions')
   const data = await res.json()
-  const comps = Array.isArray(data) ? data : (data.competitions || [])
-  return [...comps].sort((a, b) => new Date(a.start_date) - new Date(b.start_date))
-}
+  const allComps = Array.isArray(data) ? data : (data.competitions || [])
 
-async function fetchPersonEventIds(compId, wcaId) {
-  // Fetch WCIF and find person's registered event IDs
-  try {
-    const res = await fetch(`${WCA_BASE}/competitions/${compId}/wcif/public`)
-    if (!res.ok) return null
-    const wcif = await res.json()
+  // Step 2: for each comp, check WCIF to see if this person is accepted
+  // We do this concurrently but throttle to avoid hammering the API
+  const CHUNK = 10
+  const registered = []
 
-    // Get timezone
-    const timezone = wcif.schedule?.venues?.[0]?.timezone || 'UTC'
+  for (let i = 0; i < allComps.length; i += CHUNK) {
+    const chunk = allComps.slice(i, i + CHUNK)
+    const results = await Promise.all(
+      chunk.map(async comp => {
+        try {
+          const wcifRes = await fetch(`${WCA_BASE}/competitions/${comp.id}/wcif/public`)
+          if (!wcifRes.ok) return null
+          const wcif = await wcifRes.json()
+          const person = (wcif.persons || []).find(
+            p => p.wcaId === wcaId && p.registration?.status === 'accepted'
+          )
+          if (!person) return null
 
-    // Find person in registrants
-    const person = (wcif.persons || []).find(p => p.wcaId === wcaId)
-    const eventIds = person?.registration?.eventIds || null
+          // Get timezone
+          const timezone = wcif.schedule?.venues?.[0]?.timezone || 'UTC'
 
-    // Get first activity start time across all venues/rooms
-    let firstStart = null
-    for (const venue of (wcif.schedule?.venues || [])) {
-      for (const room of (venue.rooms || [])) {
-        for (const activity of (room.activities || [])) {
-          if (!firstStart || new Date(activity.startTime) < new Date(firstStart)) {
-            firstStart = activity.startTime
-          }
-          // Also check child activities
-          for (const child of (activity.childActivities || [])) {
-            if (!firstStart || new Date(child.startTime) < new Date(firstStart)) {
-              firstStart = child.startTime
+          // Get first activity start time
+          let firstStart = null
+          for (const venue of (wcif.schedule?.venues || [])) {
+            for (const room of (venue.rooms || [])) {
+              for (const activity of (room.activities || [])) {
+                if (!firstStart || new Date(activity.startTime) < new Date(firstStart)) {
+                  firstStart = activity.startTime
+                }
+                for (const child of (activity.childActivities || [])) {
+                  if (!firstStart || new Date(child.startTime) < new Date(firstStart)) {
+                    firstStart = child.startTime
+                  }
+                }
+              }
             }
           }
-        }
-      }
-    }
 
-    return { eventIds, firstStart, timezone }
-  } catch {
-    return null
+          return {
+            comp,
+            wcifInfo: {
+              eventIds: person.registration?.eventIds || [],
+              firstStart,
+              timezone,
+            }
+          }
+        } catch {
+          return null
+        }
+      })
+    )
+    results.filter(Boolean).forEach(r => registered.push(r))
   }
+
+  return registered.sort((a, b) => new Date(a.comp.start_date) - new Date(b.comp.start_date))
 }
 
 // ── Styles ────────────────────────────────────────────────────────────────────
@@ -305,10 +324,6 @@ const S = {
 
 // ── Sub-components ────────────────────────────────────────────────────────────
 
-function Tag({ children }) {
-  return <span style={{ fontSize: '10px', fontWeight: 700, padding: '3px 8px', borderRadius: '5px', letterSpacing: '0.04em' }}>{children}</span>
-}
-
 function Spinner() {
   return (
     <span style={{
@@ -348,42 +363,26 @@ function TrashIcon() {
 
 // ── CompCard ──────────────────────────────────────────────────────────────────
 
-function CompCard({ comp, wcaId }) {
-  const [info, setInfo] = useState(null) // { eventIds, firstStart, timezone }
-  const [loading, setLoading] = useState(true)
-
-  useState(() => {
-    let cancelled = false
-    fetchPersonEventIds(comp.id, wcaId).then(result => {
-      if (!cancelled) { setInfo(result); setLoading(false) }
-    })
-    return () => { cancelled = true }
-  })
-
+function CompCard({ comp, wcifInfo }) {
   const startDate = comp.start_date
   const endDate = comp.end_date || comp.start_date
-  const timezone = info?.timezone || 'UTC'
+  const timezone = wcifInfo?.timezone || 'UTC'
+  const eventIds = wcifInfo?.eventIds || comp.event_ids || []
+  const firstTime = wcifInfo?.firstStart ? formatTime(wcifInfo.firstStart, timezone) : null
 
-  // Date display — use competition's local timezone
+  // Date display in competition's local timezone
   const dateInfo = formatDate(startDate + 'T12:00:00', timezone)
   const day = dateInfo?.day || new Date(startDate + 'T00:00:00').getDate()
   const month = dateInfo?.month || MONTHS[new Date(startDate + 'T00:00:00').getMonth()]
 
   // Day of week
   const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
-  const dowDate = new Date(startDate + 'T12:00:00')
-  const dow = DAYS[dowDate.getDay()]
+  const dow = DAYS[new Date(startDate + 'T12:00:00').getDay()]
 
   // WCA Live — active if today >= start_date
   const today = new Date().toISOString().split('T')[0]
   const liveActive = startDate <= today
   const liveUrl = `https://live.worldcubeassociation.org/competitions/${comp.id}`
-
-  // First event time
-  const firstTime = info?.firstStart ? formatTime(info.firstStart, timezone) : null
-
-  // Events this person registered for
-  const eventIds = info?.eventIds || (loading ? null : comp.event_ids || [])
 
   // Location — country · venue (truncated), links to Google Maps
   const venueName = comp.venue || comp.venue_address || comp.name
@@ -422,11 +421,7 @@ function CompCard({ comp, wcaId }) {
         <a href={wcaUrl} target="_blank" rel="noopener noreferrer" style={S.compNameLink}>{comp.name}</a>
         <a href={mapsUrl} target="_blank" rel="noopener noreferrer" style={S.compLoc}>{locDisplay}</a>
         <div style={S.pills}>
-          {loading && <span style={{ fontSize: '10px', color: '#00796b' }}>loading events…</span>}
-          {!loading && eventIds && eventIds.map(id => (
-            <span key={id} style={S.pill}>{EVENT_SHORT[id] || id}</span>
-          ))}
-          {!loading && !eventIds && (comp.event_ids || []).map(id => (
+          {eventIds.map(id => (
             <span key={id} style={S.pill}>{EVENT_SHORT[id] || id}</span>
           ))}
         </div>
@@ -622,7 +617,7 @@ export default function App() {
             </div>
 
             {compsLoading && (
-              <div style={S.loading}><Spinner />Loading competitions…</div>
+              <div style={S.loading}><Spinner />Scanning upcoming competitions…</div>
             )}
 
             {compsError && <div style={S.warn}>{compsError}</div>}
@@ -631,8 +626,8 @@ export default function App() {
               <div style={S.empty}>No upcoming competitions found for this competitor.</div>
             )}
 
-            {!compsLoading && comps.map(comp => (
-              <CompCard key={comp.id} comp={comp} wcaId={selectedPerson?.wca_id} />
+            {!compsLoading && comps.map(({ comp, wcifInfo }) => (
+              <CompCard key={comp.id} comp={comp} wcifInfo={wcifInfo} />
             ))}
           </>
         )}
