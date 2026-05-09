@@ -96,33 +96,47 @@ async function searchPersons(query) {
 }
 
 async function fetchUpcomingComps(wcaId) {
-  const today = new Date().toISOString().split('T')[0]
-  const end = new Date()
-  end.setMonth(end.getMonth() + 6)
-  const endStr = end.toISOString().split('T')[0]
+  const today = new Date()
+  const todayStr = today.toISOString().split('T')[0]
 
-  // Step 1: Get all upcoming comps in date range
-  // API returns DESC (newest first), we reverse to get soonest first
+  // Scan month by month for next 6 months
+  // Narrow windows ensure external-registration comps are included
   const allComps = []
-  let page = 1
-  while (true) {
-    const res = await fetch(`${WCA_BASE}/competitions?start=${today}&end=${endStr}&per_page=100&page=${page}`)
-    if (!res.ok) break
-    const data = await res.json()
-    const comps = Array.isArray(data) ? data : (data.competitions || [])
-    if (!comps.length) break
-    allComps.push(...comps)
-    if (comps.length < 100) break
-    page++
+  for (let m = 0; m < 6; m++) {
+    const start = new Date(today)
+    start.setMonth(start.getMonth() + m)
+    if (m === 0) start.setDate(today.getDate()) // today for first month
+    else start.setDate(1)
+
+    const end = new Date(start)
+    end.setMonth(end.getMonth() + 1)
+    end.setDate(0) // last day of that month
+
+    const startStr = start.toISOString().split('T')[0]
+    const endStr = end.toISOString().split('T')[0]
+
+    try {
+      let page = 1
+      while (true) {
+        const res = await fetch(`${WCA_BASE}/competitions?start=${startStr}&end=${endStr}&per_page=100&page=${page}`)
+        if (!res.ok) break
+        const data = await res.json()
+        const comps = Array.isArray(data) ? data : (data.competitions || [])
+        if (!comps.length) break
+        // Avoid duplicates
+        comps.forEach(c => { if (!allComps.find(x => x.id === c.id)) allComps.push(c) })
+        if (comps.length < 100) break
+        page++
+      }
+    } catch { /* continue to next month */ }
   }
 
   if (!allComps.length) return []
 
-  // Reverse so soonest comps are checked first (API returns DESC)
-  allComps.reverse()
+  // Sort soonest first before scanning
+  allComps.sort((a, b) => new Date(a.start_date) - new Date(b.start_date))
 
-  // Step 2: Check WCIF for each comp sequentially in small batches
-  // WCIF contains wcaId directly and registration.status
+  // Check WCIF for each comp to find if person is registered (accepted)
   const CHUNK = 5
   const registered = []
 
@@ -135,7 +149,6 @@ async function fetchUpcomingComps(wcaId) {
           if (!wcifRes.ok) return null
           const wcif = await wcifRes.json()
 
-          // Find person with accepted registration
           const person = (wcif.persons || []).find(
             p => p.wcaId === wcaId &&
                  p.registration != null &&
@@ -146,19 +159,17 @@ async function fetchUpcomingComps(wcaId) {
           const timezone = wcif.schedule?.venues?.[0]?.timezone || 'UTC'
           const eventIds = person.registration?.eventIds || []
 
-          // Get first COMPETITION activity start time (skip other-* like check-in, lunch, awards)
+          // First competition activity start time (skip other-*)
           let firstStart = null
           for (const venue of (wcif.schedule?.venues || [])) {
             for (const room of (venue.rooms || [])) {
               for (const activity of (room.activities || [])) {
-                const code = activity.activityCode || ''
-                if (code.startsWith('other-')) continue // skip non-competition
+                if ((activity.activityCode || '').startsWith('other-')) continue
                 if (!firstStart || new Date(activity.startTime) < new Date(firstStart)) {
                   firstStart = activity.startTime
                 }
                 for (const child of (activity.childActivities || [])) {
-                  const childCode = child.activityCode || ''
-                  if (childCode.startsWith('other-')) continue
+                  if ((child.activityCode || '').startsWith('other-')) continue
                   if (!firstStart || new Date(child.startTime) < new Date(firstStart)) {
                     firstStart = child.startTime
                   }
@@ -178,7 +189,6 @@ async function fetchUpcomingComps(wcaId) {
 
   return registered.sort((a, b) => new Date(a.comp.start_date) - new Date(b.comp.start_date))
 }
-
 // ── Styles ────────────────────────────────────────────────────────────────────
 
 const S = {
