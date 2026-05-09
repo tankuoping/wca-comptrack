@@ -119,22 +119,26 @@ async function fetchUpcomingComps(wcaId) {
       let page = 1
       while (true) {
         const res = await fetch(`${WCA_BASE}/competitions?start=${startStr}&end=${endStr}&per_page=100&page=${page}`)
+        console.log(`[WCA] Month ${m} (${startStr} to ${endStr}) page ${page}: status ${res.status}`)
         if (!res.ok) break
         const data = await res.json()
         const comps = Array.isArray(data) ? data : (data.competitions || [])
+        console.log(`[WCA] Month ${m} returned ${comps.length} comps`)
+        if (comps.length) console.log('[WCA] Sample:', comps.slice(0,2).map(c => c.id))
         if (!comps.length) break
-        // Avoid duplicates
         comps.forEach(c => { if (!allComps.find(x => x.id === c.id)) allComps.push(c) })
         if (comps.length < 100) break
         page++
       }
-    } catch { /* continue to next month */ }
+    } catch(e) { console.log(`[WCA] Month ${m} error:`, e.message) }
   }
 
-  if (!allComps.length) return []
+  if (!allComps.length) { console.log('[WCA] No comps found in date range'); return [] }
 
   // Sort soonest first before scanning
   allComps.sort((a, b) => new Date(a.start_date) - new Date(b.start_date))
+  console.log(`[WCA] Total comps to scan: ${allComps.length}`)
+  console.log('[WCA] First 5:', allComps.slice(0,5).map(c => `${c.id} (${c.start_date})`))
 
   // Check WCIF for each comp to find if person is registered (accepted)
   const CHUNK = 5
@@ -145,15 +149,19 @@ async function fetchUpcomingComps(wcaId) {
     const results = await Promise.all(
       chunk.map(async comp => {
         try {
+          console.log(`[WCA] Checking WCIF: ${comp.id}`)
           const wcifRes = await fetch(`${WCA_BASE}/competitions/${comp.id}/wcif/public`)
+          console.log(`[WCA] ${comp.id} WCIF status: ${wcifRes.status}`)
           if (!wcifRes.ok) return null
           const wcif = await wcifRes.json()
+          console.log(`[WCA] ${comp.id} persons: ${wcif.persons?.length}`)
 
           const person = (wcif.persons || []).find(
             p => p.wcaId === wcaId &&
                  p.registration != null &&
                  p.registration.status === 'accepted'
           )
+          console.log(`[WCA] ${comp.id} person found: ${!!person}`)
           if (!person) return null
 
           const timezone = wcif.schedule?.venues?.[0]?.timezone || 'UTC'
