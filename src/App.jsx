@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -25,16 +25,10 @@ function isWcaId(q) {
 function formatTime(dtStr, timezone) {
   if (!dtStr) return null
   try {
-    const dt = new Date(dtStr)
-    return dt.toLocaleTimeString('en-US', {
-      hour: 'numeric',
-      minute: '2-digit',
-      hour12: true,
-      timeZone: timezone,
+    return new Date(dtStr).toLocaleTimeString('en-US', {
+      hour: 'numeric', minute: '2-digit', hour12: true, timeZone: timezone,
     })
-  } catch {
-    return null
-  }
+  } catch { return null }
 }
 
 function formatDate(dtStr, timezone) {
@@ -45,35 +39,142 @@ function formatDate(dtStr, timezone) {
       day: dt.toLocaleDateString('en-US', { day: 'numeric', timeZone: timezone }),
       month: dt.toLocaleDateString('en-US', { month: 'short', timeZone: timezone }),
     }
-  } catch {
-    return null
-  }
+  } catch { return null }
 }
 
-function buildGCalUrl(name, startDateStr, startTime, endDateStr, location, wcaUrl) {
-  // Build Google Calendar URL
-  // startTime is like "9:00 AM", startDateStr is "2026-05-24"
-  // We'll use all-day if no time available
+function buildGCalUrl(name, startDateStr, endDateStr, location, wcaUrl) {
   try {
     const start = new Date(startDateStr + 'T00:00:00')
     const end = new Date(endDateStr + 'T00:00:00')
-    end.setDate(end.getDate() + 1) // end is exclusive for all-day
-
+    end.setDate(end.getDate() + 1)
     const pad = n => String(n).padStart(2, '0')
     const fmt = d => `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`
-
-    const dates = `${fmt(start)}/${fmt(end)}`
     const params = new URLSearchParams({
-      action: 'TEMPLATE',
-      text: name,
-      dates,
-      details: `WCA Competition\n${wcaUrl}`,
-      location,
+      action: 'TEMPLATE', text: name,
+      dates: `${fmt(start)}/${fmt(end)}`,
+      details: `WCA Competition\n${wcaUrl}`, location,
     })
     return `https://calendar.google.com/calendar/render?${params.toString()}`
-  } catch {
-    return null
+  } catch { return null }
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms))
+
+// ── Background Preloader ──────────────────────────────────────────────────────
+// Starts fetching all upcoming comp WCIF data immediately on page load.
+// Builds a lookup map so searching is instant once preload is done.
+
+const preloadState = {
+  status: 'idle',   // 'idle' | 'loading' | 'done'
+  wcifMap: {},      // compId -> { comp, registrants:[{wcaId,eventIds}], timezone, firstStart }
+  scanned: 0,
+  total: 0,
+  listeners: [],
+}
+
+function notifyListeners() {
+  preloadState.listeners.forEach(fn => fn({
+    status: preloadState.status,
+    scanned: preloadState.scanned,
+    total: preloadState.total,
+  }))
+}
+
+async function fetchAllUpcomingComps() {
+  const today = new Date()
+  const allComps = []
+  for (let m = 0; m < 6; m++) {
+    const start = new Date(today)
+    start.setMonth(start.getMonth() + m)
+    if (m === 0) start.setDate(today.getDate())
+    else start.setDate(1)
+    const end = new Date(start)
+    end.setMonth(end.getMonth() + 1)
+    end.setDate(0)
+    const startStr = start.toISOString().split('T')[0]
+    const endStr = end.toISOString().split('T')[0]
+    try {
+      let page = 1
+      while (true) {
+        const res = await fetch(`${WCA_BASE}/competitions?start=${startStr}&end=${endStr}&per_page=100&page=${page}`)
+        if (!res.ok) break
+        const data = await res.json()
+        const comps = Array.isArray(data) ? data : (data.competitions || [])
+        if (!comps.length) break
+        comps.forEach(c => { if (!allComps.find(x => x.id === c.id)) allComps.push(c) })
+        if (comps.length < 100) break
+        page++
+      }
+    } catch { /* skip month */ }
   }
+  return allComps.sort((a, b) => new Date(a.start_date) - new Date(b.start_date))
+}
+
+async function startPreload() {
+  if (preloadState.status !== 'idle') return
+  preloadState.status = 'loading'
+  notifyListeners()
+
+  try {
+    const comps = await fetchAllUpcomingComps()
+    preloadState.total = comps.length
+    notifyListeners()
+
+    for (const comp of comps) {
+      await sleep(200)
+      try {
+        let res = await fetch(`${WCA_BASE}/competitions/${comp.id}/wcif/public`)
+        if (res.status === 429) {
+          await sleep(3000)
+          res = await fetch(`${WCA_BASE}/competitions/${comp.id}/wcif/public`)
+        }
+        if (res.ok) {
+          const wcif = await res.json()
+          const timezone = wcif.schedule?.venues?.[0]?.timezone || 'UTC'
+          const registrants = (wcif.persons || [])
+            .filter(p => p.wcaId && p.registration?.status === 'accepted')
+            .map(p => ({ wcaId: p.wcaId, eventIds: p.registration.eventIds || [] }))
+          let firstStart = null
+          for (const venue of (wcif.schedule?.venues || [])) {
+            for (const room of (venue.rooms || [])) {
+              for (const activity of (room.activities || [])) {
+                if ((activity.activityCode || '').startsWith('other-')) continue
+                if (!firstStart || new Date(activity.startTime) < new Date(firstStart))
+                  firstStart = activity.startTime
+              }
+            }
+          }
+          preloadState.wcifMap[comp.id] = { comp, registrants, timezone, firstStart }
+        }
+      } catch { /* skip this comp */ }
+      preloadState.scanned++
+      notifyListeners()
+    }
+  } catch (e) {
+    console.error('[WCA] Preload error:', e)
+  }
+
+  preloadState.status = 'done'
+  notifyListeners()
+}
+
+// Kick off preload immediately on module load
+startPreload()
+
+export function subscribeToPreload(fn) {
+  preloadState.listeners.push(fn)
+  fn({ status: preloadState.status, scanned: preloadState.scanned, total: preloadState.total })
+  return () => { preloadState.listeners = preloadState.listeners.filter(l => l !== fn) }
+}
+
+export function findCompsForPerson(wcaId) {
+  return Object.values(preloadState.wcifMap)
+    .filter(d => d.registrants.some(r => r.wcaId === wcaId))
+    .map(d => {
+      const reg = d.registrants.find(r => r.wcaId === wcaId)
+      return { comp: d.comp, wcifInfo: { eventIds: reg.eventIds, firstStart: d.firstStart, timezone: d.timezone } }
+    })
+    .sort((a, b) => new Date(a.comp.start_date) - new Date(b.comp.start_date))
 }
 
 // ── Fetch helpers ─────────────────────────────────────────────────────────────
@@ -95,124 +196,13 @@ async function searchPersons(query) {
   }
 }
 
-async function fetchUpcomingComps(wcaId) {
-  const today = new Date()
-  const todayStr = today.toISOString().split('T')[0]
-
-  // Scan month by month for next 6 months
-  // Narrow windows ensure external-registration comps are included
-  const allComps = []
-  for (let m = 0; m < 6; m++) {
-    const start = new Date(today)
-    start.setMonth(start.getMonth() + m)
-    if (m === 0) start.setDate(today.getDate()) // today for first month
-    else start.setDate(1)
-
-    const end = new Date(start)
-    end.setMonth(end.getMonth() + 1)
-    end.setDate(0) // last day of that month
-
-    const startStr = start.toISOString().split('T')[0]
-    const endStr = end.toISOString().split('T')[0]
-
-    try {
-      let page = 1
-      while (true) {
-        const res = await fetch(`${WCA_BASE}/competitions?start=${startStr}&end=${endStr}&per_page=100&page=${page}`)
-        console.log(`[WCA] Month ${m} (${startStr} to ${endStr}) page ${page}: status ${res.status}`)
-        if (!res.ok) break
-        const data = await res.json()
-        const comps = Array.isArray(data) ? data : (data.competitions || [])
-        console.log(`[WCA] Month ${m} returned ${comps.length} comps`)
-        if (comps.length) console.log('[WCA] Sample:', comps.slice(0,2).map(c => c.id))
-        if (!comps.length) break
-        comps.forEach(c => { if (!allComps.find(x => x.id === c.id)) allComps.push(c) })
-        if (comps.length < 100) break
-        page++
-      }
-    } catch(e) { console.log(`[WCA] Month ${m} error:`, e.message) }
-  }
-
-  if (!allComps.length) { console.log('[WCA] No comps found in date range'); return [] }
-
-  // Sort soonest first before scanning
-  allComps.sort((a, b) => new Date(a.start_date) - new Date(b.start_date))
-  console.log(`[WCA] Total comps to scan: ${allComps.length}`)
-  console.log('[WCA] First 5:', allComps.slice(0,5).map(c => `${c.id} (${c.start_date})`))
-
-  // Check WCIF for each comp to find if person is registered (accepted)
-  const CHUNK = 5
-  const registered = []
-
-  for (let i = 0; i < allComps.length; i += CHUNK) {
-    const chunk = allComps.slice(i, i + CHUNK)
-    const results = await Promise.all(
-      chunk.map(async comp => {
-        try {
-          console.log(`[WCA] Checking WCIF: ${comp.id}`)
-          const wcifRes = await fetch(`${WCA_BASE}/competitions/${comp.id}/wcif/public`)
-          console.log(`[WCA] ${comp.id} WCIF status: ${wcifRes.status}`)
-          if (!wcifRes.ok) return null
-          const wcif = await wcifRes.json()
-          console.log(`[WCA] ${comp.id} persons: ${wcif.persons?.length}`)
-
-          const person = (wcif.persons || []).find(
-            p => p.wcaId === wcaId &&
-                 p.registration != null &&
-                 p.registration.status === 'accepted'
-          )
-          console.log(`[WCA] ${comp.id} person found: ${!!person}`)
-          if (!person) return null
-
-          const timezone = wcif.schedule?.venues?.[0]?.timezone || 'UTC'
-          const eventIds = person.registration?.eventIds || []
-
-          // First competition activity start time (skip other-*)
-          let firstStart = null
-          for (const venue of (wcif.schedule?.venues || [])) {
-            for (const room of (venue.rooms || [])) {
-              for (const activity of (room.activities || [])) {
-                if ((activity.activityCode || '').startsWith('other-')) continue
-                if (!firstStart || new Date(activity.startTime) < new Date(firstStart)) {
-                  firstStart = activity.startTime
-                }
-                for (const child of (activity.childActivities || [])) {
-                  if ((child.activityCode || '').startsWith('other-')) continue
-                  if (!firstStart || new Date(child.startTime) < new Date(firstStart)) {
-                    firstStart = child.startTime
-                  }
-                }
-              }
-            }
-          }
-
-          return { comp, wcifInfo: { eventIds, firstStart, timezone } }
-        } catch {
-          return null
-        }
-      })
-    )
-    results.filter(Boolean).forEach(r => registered.push(r))
-  }
-
-  return registered.sort((a, b) => new Date(a.comp.start_date) - new Date(b.comp.start_date))
-}
 // ── Styles ────────────────────────────────────────────────────────────────────
 
 const S = {
-  app: {
-    fontFamily: "'Inter', sans-serif",
-    background: '#fff',
-    minHeight: '100vh',
-    padding: '0 0 40px',
-  },
+  app: { fontFamily: "'Inter', sans-serif", background: '#fff', minHeight: '100vh', padding: '0 0 40px' },
   header: {
-    background: '#003f88',
-    padding: '14px 20px',
-    marginBottom: '16px',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'space-between',
+    background: '#003f88', padding: '14px 20px', marginBottom: '16px',
+    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
   },
   headerTitle: { color: '#fff', fontSize: '18px', fontWeight: 700 },
   headerSub: { color: 'rgba(255,255,255,0.6)', fontSize: '10px', letterSpacing: '0.1em', marginTop: '2px' },
@@ -227,174 +217,158 @@ const S = {
     textTransform: 'uppercase', color: '#004d40', marginBottom: '6px',
   },
   searchBox: {
-    background: '#fff', border: '1.5px solid #80cbc4',
-    borderRadius: '8px', padding: '8px 12px',
-    marginBottom: '4px', display: 'flex', gap: '8px', alignItems: 'center',
+    background: '#fff', border: '1.5px solid #80cbc4', borderRadius: '8px',
+    padding: '8px 12px', marginBottom: '4px', display: 'flex', gap: '8px', alignItems: 'center',
   },
   searchInput: {
     flex: 1, border: 'none', outline: 'none',
-    fontFamily: "'Inter', sans-serif", fontSize: '14px',
-    fontWeight: 600, color: '#222', background: 'transparent',
+    fontFamily: "'Inter', sans-serif", fontSize: '14px', fontWeight: 600,
+    color: '#222', background: 'transparent',
   },
   searchBtn: {
     background: '#00695c', border: 'none', borderRadius: '6px',
-    padding: '6px 14px', color: '#fff', fontSize: '12px',
-    fontWeight: 700, cursor: 'pointer', whiteSpace: 'nowrap',
+    padding: '6px 14px', color: '#fff', fontSize: '12px', fontWeight: 700,
+    cursor: 'pointer', whiteSpace: 'nowrap',
   },
-  hint: { fontSize: '10px', color: '#80cbc4', marginBottom: '14px' },
+  hint: { fontSize: '11px', color: '#aaa', marginBottom: '12px' },
   warn: {
-    fontSize: '11px', color: '#b71c1c', background: '#ffebee',
-    border: '1px solid #ef9a9a', borderRadius: '6px',
-    padding: '6px 10px', marginBottom: '10px',
+    background: '#fff3e0', border: '1px solid #ffcc80', borderRadius: '6px',
+    padding: '8px 12px', fontSize: '12px', color: '#e65100', marginBottom: '8px',
   },
-  sep: { display: 'flex', alignItems: 'center', gap: '8px', margin: '14px 0 10px' },
+  sep: { display: 'flex', alignItems: 'center', gap: '8px', margin: '14px 0 8px' },
   sepLine: { flex: 1, height: '1px', background: '#e0f2f1' },
-  sepTxt: {
-    fontSize: '10px', fontWeight: 700, letterSpacing: '0.1em',
-    textTransform: 'uppercase', color: '#80cbc4', whiteSpace: 'nowrap',
-  },
-  resultItem: (sel) => ({
-    background: sel ? '#00695c' : '#e0f2f1',
-    border: `1.5px solid ${sel ? '#00695c' : '#80cbc4'}`,
-    borderRadius: '8px', padding: '9px 12px', marginBottom: '6px',
-    display: 'flex', alignItems: 'center', gap: '10px', cursor: 'pointer',
+  sepTxt: { fontSize: '10px', color: '#80cbc4', fontWeight: 700, letterSpacing: '0.1em', textTransform: 'uppercase' },
+  resultItem: sel => ({
+    display: 'flex', alignItems: 'center', gap: '10px',
+    padding: '10px 12px', borderRadius: '8px', marginBottom: '6px',
+    border: sel ? '1.5px solid #00695c' : '1.5px solid #b2dfdb',
+    background: sel ? '#e0f2f1' : '#fff', cursor: 'pointer',
   }),
   av: {
-    width: '32px', height: '32px', borderRadius: '50%',
-    background: '#00695c', display: 'flex', alignItems: 'center',
-    justifyContent: 'center', fontSize: '11px', fontWeight: 700,
-    color: '#fff', flexShrink: 0,
+    width: '34px', height: '34px', borderRadius: '50%',
+    background: '#b2dfdb', color: '#004d40', fontSize: '12px',
+    fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
   },
-  avSel: { background: 'rgba(255,255,255,0.2)' },
-  rName: (sel) => ({ fontSize: '13px', fontWeight: 700, color: sel ? '#fff' : '#004d40' }),
-  rMeta: (sel) => ({ fontSize: '10px', color: sel ? 'rgba(255,255,255,0.65)' : '#00796b', marginTop: '1px' }),
-  rAction: { marginLeft: 'auto', fontSize: '10px', fontWeight: 700, color: '#00796b', flexShrink: 0 },
+  avSel: { background: '#00695c', color: '#fff' },
+  rName: sel => ({ fontSize: '13px', fontWeight: 700, color: sel ? '#00695c' : '#222' }),
+  rMeta: sel => ({ fontSize: '11px', color: sel ? '#00897b' : '#888', marginTop: '1px' }),
   checkmark: {
-    width: '18px', height: '18px', borderRadius: '50%',
-    background: '#fff', display: 'flex', alignItems: 'center',
-    justifyContent: 'center', flexShrink: 0, marginLeft: 'auto',
+    width: '20px', height: '20px', borderRadius: '50%',
+    background: '#e0f2f1', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
   },
-  divider: { height: '1px', background: '#e0f2f1', margin: '16px 0' },
-  progBar: { height: '3px', background: '#e0f2f1', borderRadius: '2px', marginBottom: '14px', overflow: 'hidden' },
-  progFill: (w) => ({ height: '100%', background: '#003f88', borderRadius: '2px', width: `${w}%`, transition: 'width 0.4s' }),
+  rAction: { fontSize: '10px', fontWeight: 700, color: '#00695c', letterSpacing: '0.08em' },
+  divider: { height: '1px', background: '#e0f2f1', margin: '16px 0 12px' },
+  progBar: { height: '3px', background: '#e0f2f1', borderRadius: '2px', marginBottom: '12px' },
+  progFill: pct => ({ height: '100%', width: `${pct}%`, background: '#00695c', borderRadius: '2px', transition: 'width 0.4s' }),
+  // Subtle preload progress bar at top of page
+  preloadBar: {
+    position: 'fixed', top: 0, left: 0, right: 0, height: '3px',
+    background: '#e0f2f1', zIndex: 999,
+  },
+  preloadFill: pct => ({
+    height: '100%', width: `${pct}%`, background: '#80cbc4',
+    borderRadius: '0 2px 2px 0', transition: 'width 0.3s',
+  }),
+  preloadTip: {
+    position: 'fixed', bottom: '12px', right: '12px',
+    background: '#003f88', color: 'rgba(255,255,255,0.8)',
+    fontSize: '10px', padding: '4px 10px', borderRadius: '20px',
+    zIndex: 999, fontWeight: 600,
+  },
+  loading: {
+    display: 'flex', alignItems: 'center', gap: '8px',
+    fontSize: '13px', color: '#00695c', padding: '12px 0',
+  },
+  empty: { fontSize: '13px', color: '#888', padding: '12px 0' },
   compCard: {
-    background: '#b2dfdb', border: '1.5px solid #80cbc4',
-    borderRadius: '10px', padding: '10px 12px', marginBottom: '8px',
-    display: 'flex', gap: '10px',
+    border: '1.5px solid #80cbc4', borderRadius: '10px',
+    marginBottom: '10px', display: 'flex', overflow: 'hidden',
+    background: '#fff',
   },
   dateBox: {
-    background: '#00695c', borderRadius: '8px', padding: '7px 8px',
-    textAlign: 'center', minWidth: '48px', flexShrink: 0,
+    background: '#004d40', color: '#fff', minWidth: '70px',
     display: 'flex', flexDirection: 'column', alignItems: 'center',
-    justifyContent: 'center',
+    justifyContent: 'center', padding: '10px 8px', gap: '1px',
   },
-  dateDay: { fontSize: '18px', fontWeight: 700, color: '#fff', lineHeight: 1 },
-  dateMon: { fontSize: '9px', fontWeight: 700, color: 'rgba(255,255,255,0.7)', textTransform: 'uppercase', letterSpacing: '0.08em', marginTop: '1px' },
-  dateDow: { fontSize: '9px', fontWeight: 700, color: 'rgba(255,255,255,0.5)', marginTop: '1px' },
-  dateTime: {
-    fontSize: '9px', fontWeight: 700, color: 'rgba(255,255,255,0.55)',
-    borderTop: '1px solid rgba(255,255,255,0.2)',
-    marginTop: '3px', paddingTop: '3px', width: '100%', textAlign: 'center',
-  },
-  compBody: { flex: 1, minWidth: 0 },
+  dateDay: { fontSize: '22px', fontWeight: 800, lineHeight: 1 },
+  dateMon: { fontSize: '11px', fontWeight: 600, opacity: 0.8 },
+  dateDow: { fontSize: '10px', opacity: 0.6 },
+  dateTime: { fontSize: '9px', opacity: 0.7, marginTop: '2px' },
+  compBody: { flex: 1, padding: '8px 10px', minWidth: 0 },
   compNameLink: {
-    fontSize: '13px', fontWeight: 700, color: '#004d40',
-    margin: '0 0 2px', textDecoration: 'none', display: 'block',
+    fontSize: '13px', fontWeight: 700, color: '#003f88',
+    textDecoration: 'none', display: 'block', marginBottom: '2px',
   },
   compLoc: {
-    fontSize: '11px', color: '#00796b', margin: '0 0 7px',
-    textDecoration: 'none', display: 'block',
-    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+    fontSize: '10px', color: '#00695c', textDecoration: 'none',
+    display: 'block', marginBottom: '5px', whiteSpace: 'nowrap',
+    overflow: 'hidden', textOverflow: 'ellipsis',
   },
-  pills: { display: 'flex', flexWrap: 'wrap', gap: '4px' },
+  pills: { display: 'flex', flexWrap: 'wrap', gap: '3px' },
   pill: {
-    background: 'rgba(255,255,255,0.6)', border: '1px solid #80cbc4',
-    borderRadius: '20px', padding: '2px 8px', fontSize: '10px',
-    fontWeight: 600, color: '#004d40',
+    fontSize: '9px', fontWeight: 700, padding: '2px 6px',
+    borderRadius: '4px', background: '#e0f2f1', color: '#004d40',
   },
-  compRight: { display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '5px', flexShrink: 0 },
+  compRight: {
+    display: 'flex', flexDirection: 'column', alignItems: 'flex-end',
+    padding: '8px 10px', gap: '4px', minWidth: '110px',
+  },
   tagReg: {
-    background: '#003f88', color: '#fff', fontSize: '10px',
-    fontWeight: 700, padding: '3px 7px', borderRadius: '5px',
-    textTransform: 'uppercase', whiteSpace: 'nowrap',
+    fontSize: '9px', fontWeight: 800, letterSpacing: '0.06em',
+    background: '#003f88', color: '#fff', padding: '2px 7px', borderRadius: '4px',
   },
   groupsLink: {
-    fontSize: '10px', fontWeight: 700, color: '#003f88',
-    textDecoration: 'none', whiteSpace: 'nowrap',
-    background: 'rgba(0,63,136,0.08)', border: '1px solid rgba(0,63,136,0.25)',
-    borderRadius: '20px', padding: '2px 8px',
+    fontSize: '10px', color: '#003f88', textDecoration: 'none', fontWeight: 600,
   },
   gcalLink: {
-    fontSize: '10px', fontWeight: 700, color: '#00695c',
-    textDecoration: 'none', whiteSpace: 'nowrap',
-    background: 'rgba(0,105,92,0.08)', border: '1px solid rgba(0,105,92,0.25)',
-    borderRadius: '20px', padding: '2px 8px',
+    fontSize: '10px', color: '#fff', textDecoration: 'none', fontWeight: 600,
+    background: '#00695c', padding: '3px 7px', borderRadius: '4px',
     display: 'flex', alignItems: 'center', gap: '3px',
   },
   liveLink: {
-    fontSize: '10px', fontWeight: 700, color: '#c2185b',
-    textDecoration: 'none', whiteSpace: 'nowrap',
-    background: 'rgba(194,24,91,0.08)', border: '1px solid rgba(194,24,91,0.3)',
-    borderRadius: '20px', padding: '2px 8px',
-    display: 'flex', alignItems: 'center', gap: '3px',
+    fontSize: '10px', color: '#c2185b', textDecoration: 'none',
+    fontWeight: 600, display: 'flex', alignItems: 'center', gap: '3px',
   },
   liveLinkDisabled: {
-    fontSize: '10px', fontWeight: 700, color: '#aaa',
-    whiteSpace: 'nowrap', cursor: 'not-allowed',
-    background: 'rgba(0,0,0,0.04)', border: '1px solid rgba(0,0,0,0.1)',
-    borderRadius: '20px', padding: '2px 8px',
+    fontSize: '10px', color: '#bbb', fontWeight: 600,
     display: 'flex', alignItems: 'center', gap: '3px',
   },
-  loading: { textAlign: 'center', padding: '20px', color: '#80cbc4', fontSize: '13px', fontWeight: 600 },
-  empty: { textAlign: 'center', padding: '20px', color: '#80cbc4', fontSize: '12px' },
   clearBtn: {
-    width: '100%', padding: '12px', backgroundColor: '#ff7043',
-    border: 'none', borderRadius: '8px', color: '#fff',
-    fontFamily: "'Inter', sans-serif", fontSize: '13px',
-    fontWeight: 600, cursor: 'pointer', letterSpacing: '0.03em',
-    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px',
-    marginTop: '6px',
+    width: '100%', marginTop: '16px', background: '#ff7043', border: 'none',
+    borderRadius: '8px', padding: '12px', color: '#fff', fontSize: '13px',
+    fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center',
+    justifyContent: 'center', gap: '6px',
   },
-  footer: { textAlign: 'center', fontSize: '10px', color: '#80cbc4', marginTop: '16px', letterSpacing: '0.05em' },
+  footer: { textAlign: 'center', fontSize: '11px', color: '#aaa', marginTop: '24px', lineHeight: 1.6 },
 }
 
-// ── Sub-components ────────────────────────────────────────────────────────────
+// ── Icons ─────────────────────────────────────────────────────────────────────
 
 function Spinner() {
   return (
-    <span style={{
-      display: 'inline-block', width: '14px', height: '14px',
-      border: '2px solid #e0f2f1', borderTopColor: '#00695c',
-      borderRadius: '50%', animation: 'spin 0.7s linear infinite',
-      marginRight: '8px', verticalAlign: 'middle',
+    <div style={{
+      width: '14px', height: '14px', border: '2px solid #b2dfdb',
+      borderTopColor: '#00695c', borderRadius: '50%',
+      animation: 'spin 0.8s linear infinite', flexShrink: 0,
     }} />
   )
 }
-
-function CalIcon() {
-  return (
-    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#00695c" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-      <rect x="3" y="4" width="18" height="18" rx="2" />
-      <line x1="16" y1="2" x2="16" y2="6" />
-      <line x1="8" y1="2" x2="8" y2="6" />
-      <line x1="3" y1="10" x2="21" y2="10" />
-    </svg>
-  )
-}
-
-function DotIcon({ color }) {
-  return <svg width="8" height="8" viewBox="0 0 8 8"><circle cx="4" cy="4" r="4" fill={color} /></svg>
-}
-
 function TrashIcon() {
   return (
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
-      <polyline points="3 6 5 6 21 6" />
-      <path d="M19 6l-1 14H6L5 6" />
-      <path d="M10 11v6M14 11v6" />
-      <path d="M9 6V4h6v2" />
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14H6L5 6" /><path d="M10 11v6M14 11v6" /><path d="M9 6V4h6v2" />
     </svg>
   )
+}
+function CalIcon() {
+  return (
+    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="4" width="18" height="18" rx="2" /><line x1="16" y1="2" x2="16" y2="6" /><line x1="8" y1="2" x2="8" y2="6" /><line x1="3" y1="10" x2="21" y2="10" />
+    </svg>
+  )
+}
+function DotIcon({ color }) {
+  return <div style={{ width: '6px', height: '6px', borderRadius: '50%', background: color, flexShrink: 0 }} />
 }
 
 // ── CompCard ──────────────────────────────────────────────────────────────────
@@ -406,44 +380,26 @@ function CompCard({ comp, wcifInfo }) {
   const eventIds = wcifInfo?.eventIds || comp.event_ids || []
   const firstTime = wcifInfo?.firstStart ? formatTime(wcifInfo.firstStart, timezone) : null
 
-  // Date display in competition's local timezone
   const dateInfo = formatDate(startDate + 'T12:00:00', timezone)
   const day = dateInfo?.day || new Date(startDate + 'T00:00:00').getDate()
   const month = dateInfo?.month || MONTHS[new Date(startDate + 'T00:00:00').getMonth()]
-
-  // Day of week
   const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
   const dow = DAYS[new Date(startDate + 'T12:00:00').getDay()]
 
-  // WCA Live — active if today >= start_date
   const today = new Date().toISOString().split('T')[0]
   const liveActive = startDate <= today
   const liveUrl = `https://live.worldcubeassociation.org/competitions/${comp.id}`
-
-  // Location — country · venue (truncated), links to Google Maps
-  const venueName = comp.venue || comp.venue_address || comp.name
-  const truncateVenue = (str, max = 28) => str && str.length > max ? str.slice(0, max).trimEnd() + '…' : str
-  const country = comp.country_iso2 || ''
-  const venueShort = truncateVenue(venueName)
-  const locDisplay = [country, venueShort].filter(Boolean).join(' · ')
-  const mapsQuery = encodeURIComponent([venueName, comp.city, comp.country_iso2].filter(Boolean).join(', '))
-  const mapsUrl = `https://www.google.com/maps/search/?api=1&query=${mapsQuery}`
-
-  // For Google Cal location field still use city + country
-  const loc = [comp.city, comp.country_iso2].filter(Boolean).join(', ') || comp.city || ''
-
-  // Google Cal URL
-  const gcalUrl = buildGCalUrl(
-    comp.name,
-    startDate,
-    firstTime,
-    endDate,
-    loc,
-    comp.url || `https://www.worldcubeassociation.org/competitions/${comp.id}`
-  )
-
-  const wcaUrl = comp.url || `https://www.worldcubeassociation.org/competitions/${comp.id}`
   const groupsUrl = `https://www.competitiongroups.com/competitions/${comp.id}/psych-sheet`
+  const wcaUrl = comp.url || `https://www.worldcubeassociation.org/competitions/${comp.id}`
+  const gcalUrl = buildGCalUrl(comp.name, startDate, endDate, comp.venue || comp.city || '', wcaUrl)
+
+  const rawLoc = `${comp.country_iso2} · ${comp.venue || comp.city || ''}`
+  const locDisplay = rawLoc.length > 30 ? rawLoc.slice(0, 28) + '…' : rawLoc
+  const lat = comp.latitude_degrees
+  const lng = comp.longitude_degrees
+  const mapsUrl = lat && lng
+    ? `https://www.google.com/maps/search/?api=1&query=${lat},${lng}`
+    : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(comp.venue_address || comp.venue || comp.city || '')}`
 
   return (
     <div style={S.compCard}>
@@ -464,25 +420,18 @@ function CompCard({ comp, wcifInfo }) {
       </div>
       <div style={S.compRight}>
         <span style={S.tagReg}>Registered</span>
-        <a href={groupsUrl} target="_blank" rel="noopener noreferrer" style={S.groupsLink}>
-          competitiongroups ↗
-        </a>
+        <a href={groupsUrl} target="_blank" rel="noopener noreferrer" style={S.groupsLink}>competitiongroups ↗</a>
         {gcalUrl && (
           <a href={gcalUrl} target="_blank" rel="noopener noreferrer" style={S.gcalLink}>
-            <CalIcon />
-            add to Google Cal
+            <CalIcon />add to Google Cal
           </a>
         )}
         {liveActive ? (
           <a href={liveUrl} target="_blank" rel="noopener noreferrer" style={S.liveLink}>
-            <DotIcon color="#c2185b" />
-            WCA Live ↗
+            <DotIcon color="#c2185b" />WCA Live ↗
           </a>
         ) : (
-          <span style={S.liveLinkDisabled}>
-            <DotIcon color="#ccc" />
-            WCA Live
-          </span>
+          <span style={S.liveLinkDisabled}><DotIcon color="#ccc" />WCA Live</span>
         )}
       </div>
     </div>
@@ -500,8 +449,21 @@ export default function App() {
   const [comps, setComps] = useState([])
   const [compsLoading, setCompsLoading] = useState(false)
   const [compsError, setCompsError] = useState('')
-  const [progress, setProgress] = useState(0)
   const [showComps, setShowComps] = useState(false)
+  const [preload, setPreload] = useState({
+    status: preloadState.status,
+    scanned: preloadState.scanned,
+    total: preloadState.total,
+  })
+
+  useEffect(() => {
+    return subscribeToPreload(setPreload)
+  }, [])
+
+  const preloadPct = preload.total > 0
+    ? Math.round((preload.scanned / preload.total) * 100)
+    : 0
+  const preloadDone = preload.status === 'done'
 
   const doSearch = useCallback(async () => {
     const q = query.trim()
@@ -512,34 +474,40 @@ export default function App() {
     setSelectedPerson(null)
     setComps([])
     setShowComps(false)
-    setProgress(0)
     try {
       const results = await searchPersons(q)
       setPersons(results)
-      // Auto-select if only one result
-      if (results.length === 1) await selectPerson(results[0])
+      if (results.length === 1) await doSelectPerson(results[0])
     } catch (e) {
       setError(e.message)
     }
     setSearching(false)
   }, [query])
 
-  const selectPerson = useCallback(async (person) => {
+  async function doSelectPerson(person) {
     setSelectedPerson(person)
     setComps([])
     setCompsError('')
     setShowComps(true)
     setCompsLoading(true)
-    setProgress(30)
     try {
-      const results = await fetchUpcomingComps(person.wca_id)
-      setProgress(100)
+      // If preload is still running, wait for it to finish
+      if (preloadState.status !== 'done') {
+        await new Promise(resolve => {
+          const unsub = subscribeToPreload(state => {
+            if (state.status === 'done') { unsub(); resolve() }
+          })
+        })
+      }
+      const results = findCompsForPerson(person.wca_id)
       setComps(results)
     } catch (e) {
       setCompsError(e.message)
     }
     setCompsLoading(false)
-  }, [])
+  }
+
+  const selectPerson = useCallback((person) => doSelectPerson(person), [])
 
   const clearAll = () => {
     setQuery('')
@@ -550,17 +518,27 @@ export default function App() {
     setCompsLoading(false)
     setCompsError('')
     setShowComps(false)
-    setProgress(0)
   }
 
   const handleKey = (e) => { if (e.key === 'Enter') doSearch() }
 
   return (
     <div style={S.app}>
-      <style>{`
-        @keyframes spin { to { transform: rotate(360deg); } }
-        a.comp-name:hover { text-decoration: underline !important; }
-      `}</style>
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+
+      {/* Subtle top progress bar while preloading */}
+      {!preloadDone && (
+        <div style={S.preloadBar}>
+          <div style={S.preloadFill(preloadPct)} />
+        </div>
+      )}
+
+      {/* Floating preload status badge */}
+      {!preloadDone && preload.total > 0 && (
+        <div style={S.preloadTip}>
+          Loading data… {preload.scanned}/{preload.total}
+        </div>
+      )}
 
       {/* Header */}
       <div style={S.header}>
@@ -571,11 +549,9 @@ export default function App() {
         <a href="https://www.worldcubeassociation.org" target="_blank" rel="noopener noreferrer" style={S.logoWrap}>
           <img
             src="https://assets.worldcubeassociation.org/assets/570b6bc/assets/WCA Logo-4ef000323c6a9a407cdf07647a31c0ef4dc847f2352a9a136ef3e809e95bdeab.svg"
-            alt="WCA"
-            style={{ height: '28px', width: 'auto' }}
-            onError={e => { e.target.style.display = 'none'; e.target.nextSibling.style.display = 'block' }}
+            alt="WCA" style={{ height: '28px', width: 'auto' }}
+            onError={e => { e.target.style.display = 'none' }}
           />
-          <span style={{ display: 'none', color: '#fff', fontSize: '11px', fontWeight: 700 }}>WCA</span>
         </a>
       </div>
 
@@ -613,7 +589,6 @@ export default function App() {
               </div>
               <div style={S.sepLine} />
             </div>
-
             {persons.map(p => {
               const sel = selectedPerson?.wca_id === p.wca_id
               return (
@@ -623,15 +598,13 @@ export default function App() {
                     <div style={S.rName(sel)}>{p.name}</div>
                     <div style={S.rMeta(sel)}>{[p.country_iso2, p.wca_id].filter(Boolean).join(' · ')}</div>
                   </div>
-                  {sel ? (
-                    <div style={S.checkmark}>
-                      <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-                        <polyline points="1.5,5 4,7.5 8.5,2.5" stroke="#00695c" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-                      </svg>
-                    </div>
-                  ) : (
-                    <div style={S.rAction}>SELECT</div>
-                  )}
+                  {sel
+                    ? <div style={S.checkmark}>
+                        <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+                          <polyline points="1.5,5 4,7.5 8.5,2.5" stroke="#00695c" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                        </svg>
+                      </div>
+                    : <div style={S.rAction}>SELECT</div>}
                 </div>
               )
             })}
@@ -642,18 +615,17 @@ export default function App() {
         {showComps && (
           <>
             <div style={S.divider} />
-            <div style={S.progBar}>
-              <div style={S.progFill(progress)} />
-            </div>
-
             <div style={S.lbl}>
               {compsLoading
-                ? 'Upcoming competitions'
+                ? `Upcoming competitions — waiting for data… (${preload.scanned}/${preload.total})`
                 : `Upcoming competitions (${comps.length})`}
             </div>
 
             {compsLoading && (
-              <div style={S.loading}><Spinner />Scanning upcoming competitions…</div>
+              <div style={S.loading}>
+                <Spinner />
+                {preloadDone ? 'Loading…' : `Background scan in progress: ${preload.scanned}/${preload.total} comps checked`}
+              </div>
             )}
 
             {compsError && <div style={S.warn}>{compsError}</div>}
@@ -671,8 +643,7 @@ export default function App() {
         {/* Clear */}
         {(persons.length > 0 || showComps) && (
           <button style={S.clearBtn} onClick={clearAll}>
-            <TrashIcon />
-            Clear / New Search
+            <TrashIcon />Clear / New Search
           </button>
         )}
 
@@ -680,7 +651,6 @@ export default function App() {
           WCA-CompTrack · by tankuoping@gmail.com<br />
           Chief tester: Jovan Susanto
         </div>
-
       </div>
     </div>
   )
