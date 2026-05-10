@@ -117,16 +117,21 @@ async function startPreload() {
 
   try {
     const comps = await fetchAllUpcomingComps()
+    preloadState.comps = comps
     preloadState.total = comps.length
     notifyListeners()
 
     for (const comp of comps) {
-      await sleep(200)
+      await sleep(300)
       try {
         let res = await fetch(`${WCA_BASE}/competitions/${comp.id}/wcif/public`)
+        // Retry up to 4 times on 429 with increasing backoff
         if (res.status === 429) {
-          await sleep(3000)
-          res = await fetch(`${WCA_BASE}/competitions/${comp.id}/wcif/public`)
+          for (const wait of [3000, 5000, 8000, 12000]) {
+            await sleep(wait)
+            res = await fetch(`${WCA_BASE}/competitions/${comp.id}/wcif/public`)
+            if (res.status !== 429) break
+          }
         }
         if (res.ok) {
           const wcif = await res.json()
@@ -167,14 +172,48 @@ export function subscribeToPreload(fn) {
   return () => { preloadState.listeners = preloadState.listeners.filter(l => l !== fn) }
 }
 
-export function findCompsForPerson(wcaId) {
-  return Object.values(preloadState.wcifMap)
+export async function findCompsForPerson(wcaId) {
+  // First check what's already in the cache
+  const cached = Object.values(preloadState.wcifMap)
     .filter(d => d.registrants.some(r => r.wcaId === wcaId))
     .map(d => {
       const reg = d.registrants.find(r => r.wcaId === wcaId)
       return { comp: d.comp, wcifInfo: { eventIds: reg.eventIds, firstStart: d.firstStart, timezone: d.timezone } }
     })
-    .sort((a, b) => new Date(a.comp.start_date) - new Date(b.comp.start_date))
+
+  // Also retry any comps that were missed (429'd or errored) during preload
+  // We identify missed comps as those in preloadState.comps but not in wcifMap
+  const missedComps = (preloadState.comps || []).filter(c => !preloadState.wcifMap[c.id])
+  for (const comp of missedComps) {
+    await sleep(300)
+    try {
+      let res = await fetch(`${WCA_BASE}/competitions/${comp.id}/wcif/public`)
+      if (res.status === 429) { await sleep(4000); res = await fetch(`${WCA_BASE}/competitions/${comp.id}/wcif/public`) }
+      if (!res.ok) continue
+      const wcif = await res.json()
+      const timezone = wcif.schedule?.venues?.[0]?.timezone || 'UTC'
+      const registrants = (wcif.persons || [])
+        .filter(p => p.wcaId && p.registration?.status === 'accepted')
+        .map(p => ({ wcaId: p.wcaId, eventIds: p.registration.eventIds || [] }))
+      let firstStart = null
+      for (const venue of (wcif.schedule?.venues || [])) {
+        for (const room of (venue.rooms || [])) {
+          for (const activity of (room.activities || [])) {
+            if ((activity.activityCode || '').startsWith('other-')) continue
+            if (!firstStart || new Date(activity.startTime) < new Date(firstStart))
+              firstStart = activity.startTime
+          }
+        }
+      }
+      // Store in cache so future searches benefit
+      preloadState.wcifMap[comp.id] = { comp, registrants, timezone, firstStart }
+      // Check if this person is in it
+      const reg = registrants.find(r => r.wcaId === wcaId)
+      if (reg) cached.push({ comp, wcifInfo: { eventIds: reg.eventIds, firstStart, timezone } })
+    } catch { /* skip */ }
+  }
+
+  return cached.sort((a, b) => new Date(a.comp.start_date) - new Date(b.comp.start_date))
 }
 
 // ── Fetch helpers ─────────────────────────────────────────────────────────────
@@ -499,7 +538,7 @@ export default function App() {
           })
         })
       }
-      const results = findCompsForPerson(person.wca_id)
+      const results = await findCompsForPerson(person.wca_id)
       setComps(results)
     } catch (e) {
       setCompsError(e.message)
