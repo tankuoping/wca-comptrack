@@ -3,7 +3,7 @@ import { useState, useCallback, useEffect } from 'react'
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const WCA_BASE = 'https://www.worldcubeassociation.org/api/v0'
-const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+const CACHE_URL = '/wcif-cache.json'
 
 const EVENT_SHORT = {
   '333': '3x3', '222': '2x2', '444': '4x4', '555': '5x5',
@@ -31,17 +31,6 @@ function formatTime(dtStr, timezone) {
   } catch { return null }
 }
 
-function formatDate(dtStr, timezone) {
-  if (!dtStr) return null
-  try {
-    const dt = new Date(dtStr)
-    return {
-      day: dt.toLocaleDateString('en-US', { day: 'numeric', timeZone: timezone }),
-      month: dt.toLocaleDateString('en-US', { month: 'short', timeZone: timezone }),
-    }
-  } catch { return null }
-}
-
 function buildGCalUrl(name, startDateStr, endDateStr, location, wcaUrl) {
   try {
     const start = new Date(startDateStr + 'T00:00:00')
@@ -58,165 +47,85 @@ function buildGCalUrl(name, startDateStr, endDateStr, location, wcaUrl) {
   } catch { return null }
 }
 
-const sleep = ms => new Promise(r => setTimeout(r, ms))
+function formatCacheAge(builtAt) {
+  if (!builtAt) return 'unknown'
+  const diff = Date.now() - new Date(builtAt).getTime()
+  const hours = Math.floor(diff / 3600000)
+  const mins = Math.floor((diff % 3600000) / 60000)
+  if (hours > 48) return `${Math.floor(hours / 24)}d ago`
+  if (hours > 0) return `${hours}h ${mins}m ago`
+  return `${mins}m ago`
+}
 
-// ── Background Preloader ──────────────────────────────────────────────────────
-// Starts fetching all upcoming comp WCIF data immediately on page load.
-// Builds a lookup map so searching is instant once preload is done.
+function formatCacheDateTime(builtAt) {
+  if (!builtAt) return null
+  try {
+    return new Date(builtAt).toLocaleString('en-SG', {
+      timeZone: 'Asia/Singapore',
+      day: '2-digit', month: 'short', year: 'numeric',
+      hour: '2-digit', minute: '2-digit', hour12: true,
+    }) + ' SGT'
+  } catch {
+    return new Date(builtAt).toISOString().replace('T', ' ').slice(0, 16) + ' UTC'
+  }
+}
 
-const preloadState = {
-  status: 'idle',   // 'idle' | 'loading' | 'done'
-  wcifMap: {},      // compId -> { comp, registrants:[{wcaId,eventIds}], timezone, firstStart }
-  scanned: 0,
-  total: 0,
+// ── Cache loader ──────────────────────────────────────────────────────────────
+
+const cacheState = {
+  status: 'idle',   // 'idle' | 'loading' | 'ready' | 'error'
+  wcifMap: {},
+  builtAt: null,
+  totalComps: 0,
+  scannedComps: 0,
   listeners: [],
 }
 
 function notifyListeners() {
-  preloadState.listeners.forEach(fn => fn({
-    status: preloadState.status,
-    scanned: preloadState.scanned,
-    total: preloadState.total,
-  }))
+  cacheState.listeners.forEach(fn => fn({ ...cacheState }))
 }
 
-async function fetchAllUpcomingComps() {
-  const today = new Date()
-  const allComps = []
-  for (let m = 0; m < 6; m++) {
-    const start = new Date(today)
-    start.setMonth(start.getMonth() + m)
-    if (m === 0) start.setDate(today.getDate())
-    else start.setDate(1)
-    const end = new Date(start)
-    end.setMonth(end.getMonth() + 1)
-    end.setDate(0)
-    const startStr = start.toISOString().split('T')[0]
-    const endStr = end.toISOString().split('T')[0]
-    try {
-      let page = 1
-      while (true) {
-        const res = await fetch(`${WCA_BASE}/competitions?start=${startStr}&end=${endStr}&per_page=100&page=${page}`)
-        if (!res.ok) break
-        const data = await res.json()
-        const comps = Array.isArray(data) ? data : (data.competitions || [])
-        if (!comps.length) break
-        comps.forEach(c => { if (!allComps.find(x => x.id === c.id)) allComps.push(c) })
-        if (comps.length < 100) break
-        page++
-      }
-    } catch { /* skip month */ }
-  }
-  return allComps.sort((a, b) => new Date(a.start_date) - new Date(b.start_date))
-}
-
-async function startPreload() {
-  if (preloadState.status !== 'idle') return
-  preloadState.status = 'loading'
+async function loadCache() {
+  if (cacheState.status === 'loading') return
+  cacheState.status = 'loading'
   notifyListeners()
-
   try {
-    const comps = await fetchAllUpcomingComps()
-    preloadState.comps = comps
-    preloadState.total = comps.length
-    notifyListeners()
-
-    for (const comp of comps) {
-      await sleep(300)
-      try {
-        let res = await fetch(`${WCA_BASE}/competitions/${comp.id}/wcif/public`)
-        // Retry up to 4 times on 429 with increasing backoff
-        if (res.status === 429) {
-          for (const wait of [3000, 5000, 8000, 12000]) {
-            await sleep(wait)
-            res = await fetch(`${WCA_BASE}/competitions/${comp.id}/wcif/public`)
-            if (res.status !== 429) break
-          }
-        }
-        if (res.ok) {
-          const wcif = await res.json()
-          const timezone = wcif.schedule?.venues?.[0]?.timezone || 'UTC'
-          const registrants = (wcif.persons || [])
-            .filter(p => p.wcaId && p.registration?.status === 'accepted')
-            .map(p => ({ wcaId: p.wcaId, eventIds: p.registration.eventIds || [] }))
-          let firstStart = null
-          for (const venue of (wcif.schedule?.venues || [])) {
-            for (const room of (venue.rooms || [])) {
-              for (const activity of (room.activities || [])) {
-                if ((activity.activityCode || '').startsWith('other-')) continue
-                if (!firstStart || new Date(activity.startTime) < new Date(firstStart))
-                  firstStart = activity.startTime
-              }
-            }
-          }
-          preloadState.wcifMap[comp.id] = { comp, registrants, timezone, firstStart }
-        }
-      } catch { /* skip this comp */ }
-      preloadState.scanned++
-      notifyListeners()
-    }
+    // Cache-bust so we always get the latest from the server
+    const res = await fetch(`${CACHE_URL}?t=${Date.now()}`)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const data = await res.json()
+    cacheState.wcifMap = data.wcifMap || {}
+    cacheState.builtAt = data.builtAt || null
+    cacheState.totalComps = data.totalComps || 0
+    cacheState.scannedComps = data.scannedComps || 0
+    cacheState.status = 'ready'
   } catch (e) {
-    console.error('[WCA] Preload error:', e)
+    console.error('[Cache] Load failed:', e)
+    cacheState.status = 'error'
   }
-
-  preloadState.status = 'done'
   notifyListeners()
 }
 
-// Kick off preload immediately on module load
-startPreload()
-
-export function subscribeToPreload(fn) {
-  preloadState.listeners.push(fn)
-  fn({ status: preloadState.status, scanned: preloadState.scanned, total: preloadState.total })
-  return () => { preloadState.listeners = preloadState.listeners.filter(l => l !== fn) }
+function subscribeToCache(fn) {
+  cacheState.listeners.push(fn)
+  fn({ ...cacheState })
+  return () => { cacheState.listeners = cacheState.listeners.filter(l => l !== fn) }
 }
 
-export async function findCompsForPerson(wcaId) {
-  // First check what's already in the cache
-  const cached = Object.values(preloadState.wcifMap)
-    .filter(d => d.registrants.some(r => r.wcaId === wcaId))
+function findCompsForPerson(wcaId) {
+  return Object.values(cacheState.wcifMap)
+    .filter(d => d.registrants?.some(r => r.wcaId === wcaId))
     .map(d => {
       const reg = d.registrants.find(r => r.wcaId === wcaId)
       return { comp: d.comp, wcifInfo: { eventIds: reg.eventIds, firstStart: d.firstStart, timezone: d.timezone } }
     })
-
-  // Also retry any comps that were missed (429'd or errored) during preload
-  // We identify missed comps as those in preloadState.comps but not in wcifMap
-  const missedComps = (preloadState.comps || []).filter(c => !preloadState.wcifMap[c.id])
-  for (const comp of missedComps) {
-    await sleep(300)
-    try {
-      let res = await fetch(`${WCA_BASE}/competitions/${comp.id}/wcif/public`)
-      if (res.status === 429) { await sleep(4000); res = await fetch(`${WCA_BASE}/competitions/${comp.id}/wcif/public`) }
-      if (!res.ok) continue
-      const wcif = await res.json()
-      const timezone = wcif.schedule?.venues?.[0]?.timezone || 'UTC'
-      const registrants = (wcif.persons || [])
-        .filter(p => p.wcaId && p.registration?.status === 'accepted')
-        .map(p => ({ wcaId: p.wcaId, eventIds: p.registration.eventIds || [] }))
-      let firstStart = null
-      for (const venue of (wcif.schedule?.venues || [])) {
-        for (const room of (venue.rooms || [])) {
-          for (const activity of (room.activities || [])) {
-            if ((activity.activityCode || '').startsWith('other-')) continue
-            if (!firstStart || new Date(activity.startTime) < new Date(firstStart))
-              firstStart = activity.startTime
-          }
-        }
-      }
-      // Store in cache so future searches benefit
-      preloadState.wcifMap[comp.id] = { comp, registrants, timezone, firstStart }
-      // Check if this person is in it
-      const reg = registrants.find(r => r.wcaId === wcaId)
-      if (reg) cached.push({ comp, wcifInfo: { eventIds: reg.eventIds, firstStart, timezone } })
-    } catch { /* skip */ }
-  }
-
-  return cached.sort((a, b) => new Date(a.comp.start_date) - new Date(b.comp.start_date))
+    .sort((a, b) => new Date(a.comp.start_date) - new Date(b.comp.start_date))
 }
 
-// ── Fetch helpers ─────────────────────────────────────────────────────────────
+// Load cache immediately on module load
+loadCache()
+
+// ── Person search ─────────────────────────────────────────────────────────────
 
 async function searchPersons(query) {
   if (isWcaId(query)) {
@@ -251,6 +160,13 @@ const S = {
     borderRadius: '8px', padding: '6px 10px',
   },
   inner: { maxWidth: '460px', margin: '0 auto', padding: '0 16px' },
+  cacheBanner: (status) => ({
+    background: status === 'error' ? '#fff3e0' : status === 'loading' ? '#e8f5e9' : '#e0f2f1',
+    border: `1px solid ${status === 'error' ? '#ffcc80' : status === 'loading' ? '#a5d6a7' : '#80cbc4'}`,
+    borderRadius: '8px', padding: '8px 12px', marginBottom: '12px',
+    display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+    fontSize: '11px', color: '#004d40',
+  }),
   lbl: {
     fontSize: '10px', fontWeight: 700, letterSpacing: '0.12em',
     textTransform: 'uppercase', color: '#004d40', marginBottom: '6px',
@@ -297,27 +213,6 @@ const S = {
   },
   rAction: { fontSize: '10px', fontWeight: 700, color: '#00695c', letterSpacing: '0.08em' },
   divider: { height: '1px', background: '#e0f2f1', margin: '16px 0 12px' },
-  progBar: { height: '3px', background: '#e0f2f1', borderRadius: '2px', marginBottom: '12px' },
-  progFill: pct => ({ height: '100%', width: `${pct}%`, background: '#00695c', borderRadius: '2px', transition: 'width 0.4s' }),
-  // Subtle preload progress bar at top of page
-  preloadBar: {
-    position: 'fixed', top: 0, left: 0, right: 0, height: '3px',
-    background: '#e0f2f1', zIndex: 999,
-  },
-  preloadFill: pct => ({
-    height: '100%', width: `${pct}%`, background: '#80cbc4',
-    borderRadius: '0 2px 2px 0', transition: 'width 0.3s',
-  }),
-  preloadTip: {
-    position: 'fixed', bottom: '12px', right: '12px',
-    background: '#003f88', color: 'rgba(255,255,255,0.8)',
-    fontSize: '10px', padding: '4px 10px', borderRadius: '20px',
-    zIndex: 999, fontWeight: 600,
-  },
-  loading: {
-    display: 'flex', alignItems: 'center', gap: '8px',
-    fontSize: '13px', color: '#00695c', padding: '12px 0',
-  },
   empty: { fontSize: '13px', color: '#888', padding: '12px 0' },
   compCard: {
     border: '1.5px solid #80cbc4', borderRadius: '10px',
@@ -356,42 +251,42 @@ const S = {
     fontSize: '9px', fontWeight: 800, letterSpacing: '0.06em',
     background: '#003f88', color: '#fff', padding: '2px 7px', borderRadius: '4px',
   },
-  groupsLink: {
-    fontSize: '10px', color: '#003f88', textDecoration: 'none', fontWeight: 600,
-  },
+  groupsLink: { fontSize: '10px', color: '#003f88', textDecoration: 'none', fontWeight: 600 },
   gcalLink: {
     fontSize: '10px', color: '#fff', textDecoration: 'none', fontWeight: 600,
     background: '#00695c', padding: '3px 7px', borderRadius: '4px',
     display: 'flex', alignItems: 'center', gap: '3px',
   },
-  liveLink: {
-    fontSize: '10px', color: '#c2185b', textDecoration: 'none',
-    fontWeight: 600, display: 'flex', alignItems: 'center', gap: '3px',
-  },
-  liveLinkDisabled: {
-    fontSize: '10px', color: '#bbb', fontWeight: 600,
-    display: 'flex', alignItems: 'center', gap: '3px',
-  },
+  liveLink: { fontSize: '10px', color: '#c2185b', textDecoration: 'none', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '3px' },
+  liveLinkDisabled: { fontSize: '10px', color: '#bbb', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '3px' },
   clearBtn: {
     width: '100%', marginTop: '16px', background: '#ff7043', border: 'none',
     borderRadius: '8px', padding: '12px', color: '#fff', fontSize: '13px',
     fontWeight: 700, cursor: 'pointer', display: 'flex', alignItems: 'center',
     justifyContent: 'center', gap: '6px',
   },
+  refreshBtn: (loading) => ({
+    width: '100%', marginTop: '8px', background: loading ? '#90a4ae' : '#003f88',
+    border: 'none', borderRadius: '8px', padding: '12px', color: '#fff',
+    fontSize: '13px', fontWeight: 700, cursor: loading ? 'not-allowed' : 'pointer',
+    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px',
+    transition: 'background 0.2s',
+  }),
   footer: { textAlign: 'center', fontSize: '11px', color: '#aaa', marginTop: '24px', lineHeight: 1.6 },
 }
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
 
-function Spinner() {
+function Spinner({ size = 14, color = '#00695c' }) {
   return (
     <div style={{
-      width: '14px', height: '14px', border: '2px solid #b2dfdb',
-      borderTopColor: '#00695c', borderRadius: '50%',
+      width: size, height: size, border: `2px solid ${color}33`,
+      borderTopColor: color, borderRadius: '50%',
       animation: 'spin 0.8s linear infinite', flexShrink: 0,
     }} />
   )
 }
+
 function TrashIcon() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
@@ -399,6 +294,7 @@ function TrashIcon() {
     </svg>
   )
 }
+
 function CalIcon() {
   return (
     <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
@@ -406,6 +302,16 @@ function CalIcon() {
     </svg>
   )
 }
+
+function RefreshIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="23 4 23 10 17 10" /><polyline points="1 20 1 14 7 14" />
+      <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+    </svg>
+  )
+}
+
 function DotIcon({ color }) {
   return <div style={{ width: '6px', height: '6px', borderRadius: '50%', background: color, flexShrink: 0 }} />
 }
@@ -419,11 +325,10 @@ function CompCard({ comp, wcifInfo }) {
   const eventIds = wcifInfo?.eventIds || comp.event_ids || []
   const firstTime = wcifInfo?.firstStart ? formatTime(wcifInfo.firstStart, timezone) : null
 
-  const dateInfo = formatDate(startDate + 'T12:00:00', timezone)
-  const day = dateInfo?.day || new Date(startDate + 'T00:00:00').getDate()
-  const month = dateInfo?.month || MONTHS[new Date(startDate + 'T00:00:00').getMonth()]
-  const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
-  const dow = DAYS[new Date(startDate + 'T12:00:00').getDay()]
+  const d = new Date(startDate + 'T12:00:00')
+  const day = d.getDate()
+  const month = d.toLocaleString('en-US', { month: 'short' })
+  const dow = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][d.getDay()]
 
   const today = new Date().toISOString().split('T')[0]
   const liveActive = startDate <= today
@@ -434,8 +339,7 @@ function CompCard({ comp, wcifInfo }) {
 
   const rawLoc = `${comp.country_iso2} · ${comp.venue || comp.city || ''}`
   const locDisplay = rawLoc.length > 30 ? rawLoc.slice(0, 28) + '…' : rawLoc
-  const lat = comp.latitude_degrees
-  const lng = comp.longitude_degrees
+  const lat = comp.latitude_degrees, lng = comp.longitude_degrees
   const mapsUrl = lat && lng
     ? `https://www.google.com/maps/search/?api=1&query=${lat},${lng}`
     : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(comp.venue_address || comp.venue || comp.city || '')}`
@@ -452,9 +356,7 @@ function CompCard({ comp, wcifInfo }) {
         <a href={wcaUrl} target="_blank" rel="noopener noreferrer" style={S.compNameLink}>{comp.name}</a>
         <a href={mapsUrl} target="_blank" rel="noopener noreferrer" style={S.compLoc}>{locDisplay}</a>
         <div style={S.pills}>
-          {eventIds.map(id => (
-            <span key={id} style={S.pill}>{EVENT_SHORT[id] || id}</span>
-          ))}
+          {eventIds.map(id => <span key={id} style={S.pill}>{EVENT_SHORT[id] || id}</span>)}
         </div>
       </div>
       <div style={S.compRight}>
@@ -465,13 +367,9 @@ function CompCard({ comp, wcifInfo }) {
             <CalIcon />add to Google Cal
           </a>
         )}
-        {liveActive ? (
-          <a href={liveUrl} target="_blank" rel="noopener noreferrer" style={S.liveLink}>
-            <DotIcon color="#c2185b" />WCA Live ↗
-          </a>
-        ) : (
-          <span style={S.liveLinkDisabled}><DotIcon color="#ccc" />WCA Live</span>
-        )}
+        {liveActive
+          ? <a href={liveUrl} target="_blank" rel="noopener noreferrer" style={S.liveLink}><DotIcon color="#c2185b" />WCA Live ↗</a>
+          : <span style={S.liveLinkDisabled}><DotIcon color="#ccc" />WCA Live</span>}
       </div>
     </div>
   )
@@ -486,23 +384,10 @@ export default function App() {
   const [persons, setPersons] = useState([])
   const [selectedPerson, setSelectedPerson] = useState(null)
   const [comps, setComps] = useState([])
-  const [compsLoading, setCompsLoading] = useState(false)
-  const [compsError, setCompsError] = useState('')
   const [showComps, setShowComps] = useState(false)
-  const [preload, setPreload] = useState({
-    status: preloadState.status,
-    scanned: preloadState.scanned,
-    total: preloadState.total,
-  })
+  const [cache, setCache] = useState({ status: cacheState.status, builtAt: cacheState.builtAt, scannedComps: cacheState.scannedComps })
 
-  useEffect(() => {
-    return subscribeToPreload(setPreload)
-  }, [])
-
-  const preloadPct = preload.total > 0
-    ? Math.round((preload.scanned / preload.total) * 100)
-    : 0
-  const preloadDone = preload.status === 'done'
+  useEffect(() => subscribeToCache(s => setCache({ status: s.status, builtAt: s.builtAt, scannedComps: s.scannedComps })), [])
 
   const doSearch = useCallback(async () => {
     const q = query.trim()
@@ -516,68 +401,46 @@ export default function App() {
     try {
       const results = await searchPersons(q)
       setPersons(results)
-      if (results.length === 1) await doSelectPerson(results[0])
-    } catch (e) {
-      setError(e.message)
-    }
+      if (results.length === 1) doSelectPerson(results[0])
+    } catch (e) { setError(e.message) }
     setSearching(false)
   }, [query])
 
-  async function doSelectPerson(person) {
+  function doSelectPerson(person) {
     setSelectedPerson(person)
-    setComps([])
-    setCompsError('')
     setShowComps(true)
-    setCompsLoading(true)
-    try {
-      // If preload is still running, wait for it to finish
-      if (preloadState.status !== 'done') {
-        await new Promise(resolve => {
-          const unsub = subscribeToPreload(state => {
-            if (state.status === 'done') { unsub(); resolve() }
-          })
-        })
-      }
-      const results = await findCompsForPerson(person.wca_id)
-      setComps(results)
-    } catch (e) {
-      setCompsError(e.message)
-    }
-    setCompsLoading(false)
+    const results = findCompsForPerson(person.wca_id)
+    setComps(results)
   }
 
-  const selectPerson = useCallback((person) => doSelectPerson(person), [])
-
   const clearAll = () => {
-    setQuery('')
-    setError('')
-    setPersons([])
-    setSelectedPerson(null)
-    setComps([])
-    setCompsLoading(false)
-    setCompsError('')
-    setShowComps(false)
+    setQuery(''); setError(''); setPersons([])
+    setSelectedPerson(null); setComps([]); setShowComps(false)
   }
 
   const handleKey = (e) => { if (e.key === 'Enter') doSearch() }
 
+  const handleRefresh = () => {
+    // Reset cache state and reload
+    cacheState.status = 'idle'
+    cacheState.wcifMap = {}
+    loadCache()
+    // If a person is selected, re-query after cache loads
+    if (selectedPerson) {
+      const unsub = subscribeToCache(s => {
+        if (s.status === 'ready') {
+          setComps(findCompsForPerson(selectedPerson.wca_id))
+          unsub()
+        }
+      })
+    }
+  }
+
+  const cacheLoading = cache.status === 'loading'
+
   return (
     <div style={S.app}>
       <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
-
-      {/* Subtle top progress bar while preloading */}
-      {!preloadDone && (
-        <div style={S.preloadBar}>
-          <div style={S.preloadFill(preloadPct)} />
-        </div>
-      )}
-
-      {/* Floating preload status badge */}
-      {!preloadDone && preload.total > 0 && (
-        <div style={S.preloadTip}>
-          Loading data… {preload.scanned}/{preload.total}
-        </div>
-      )}
 
       {/* Header */}
       <div style={S.header}>
@@ -586,15 +449,31 @@ export default function App() {
           <div style={S.headerSub}>UPCOMING · BY COMPETITOR</div>
         </div>
         <a href="https://www.worldcubeassociation.org" target="_blank" rel="noopener noreferrer" style={S.logoWrap}>
-          <img
-            src="https://assets.worldcubeassociation.org/assets/570b6bc/assets/WCA Logo-4ef000323c6a9a407cdf07647a31c0ef4dc847f2352a9a136ef3e809e95bdeab.svg"
+          <img src="https://assets.worldcubeassociation.org/assets/570b6bc/assets/WCA Logo-4ef000323c6a9a407cdf07647a31c0ef4dc847f2352a9a136ef3e809e95bdeab.svg"
             alt="WCA" style={{ height: '28px', width: 'auto' }}
-            onError={e => { e.target.style.display = 'none' }}
-          />
+            onError={e => { e.target.style.display = 'none' }} />
         </a>
       </div>
 
       <div style={S.inner}>
+
+        {/* Cache status banner */}
+        <div style={S.cacheBanner(cache.status)}>
+          <div>
+            <div style={{ fontWeight: 700, marginBottom: cache.builtAt ? '2px' : 0 }}>
+              {cache.status === 'loading' && '⏳ Loading competition data…'}
+              {cache.status === 'ready' && `✓ ${cache.scannedComps} comps cached · updated ${formatCacheAge(cache.builtAt)}`}
+              {cache.status === 'error' && '⚠ Cache unavailable — try refreshing below'}
+              {cache.status === 'idle' && 'Initialising…'}
+            </div>
+            {cache.status === 'ready' && cache.builtAt && (
+              <div style={{ opacity: 0.75, fontSize: '10px' }}>
+                Last updated: {formatCacheDateTime(cache.builtAt)}
+              </div>
+            )}
+          </div>
+          {cacheLoading && <Spinner size={12} color="#00695c" />}
+        </div>
 
         {/* Search */}
         <div style={S.lbl}>Search competitor</div>
@@ -606,12 +485,8 @@ export default function App() {
             onKeyDown={handleKey}
             placeholder='e.g. "luis tan" or "2023YILU01"'
           />
-          <button
-            style={{ ...S.searchBtn, opacity: searching ? 0.6 : 1 }}
-            onClick={doSearch}
-            disabled={searching}
-          >
-            {searching ? '...' : 'Search'}
+          <button style={{ ...S.searchBtn, opacity: searching ? 0.6 : 1 }} onClick={doSearch} disabled={searching}>
+            {searching ? '…' : 'Search'}
           </button>
         </div>
         <div style={S.hint}>e.g. "luis tan" or "2023YILU01"</div>
@@ -623,15 +498,13 @@ export default function App() {
           <>
             <div style={S.sep}>
               <div style={S.sepLine} />
-              <div style={S.sepTxt}>
-                {persons.length === 1 ? '1 result' : `${persons.length} results — pick one`}
-              </div>
+              <div style={S.sepTxt}>{persons.length === 1 ? '1 result' : `${persons.length} results — pick one`}</div>
               <div style={S.sepLine} />
             </div>
             {persons.map(p => {
               const sel = selectedPerson?.wca_id === p.wca_id
               return (
-                <div key={p.wca_id} style={S.resultItem(sel)} onClick={() => selectPerson(p)}>
+                <div key={p.wca_id} style={S.resultItem(sel)} onClick={() => doSelectPerson(p)}>
                   <div style={{ ...S.av, ...(sel ? S.avSel : {}) }}>{initials(p.name)}</div>
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={S.rName(sel)}>{p.name}</div>
@@ -654,37 +527,31 @@ export default function App() {
         {showComps && (
           <>
             <div style={S.divider} />
-            <div style={S.lbl}>
-              {compsLoading
-                ? `Upcoming competitions — waiting for data… (${preload.scanned}/${preload.total})`
-                : `Upcoming competitions (${comps.length})`}
-            </div>
-
-            {compsLoading && (
-              <div style={S.loading}>
-                <Spinner />
-                {preloadDone ? 'Loading…' : `Background scan in progress: ${preload.scanned}/${preload.total} comps checked`}
+            <div style={S.lbl}>Upcoming competitions ({comps.length})</div>
+            {comps.length === 0 && (
+              <div style={S.empty}>
+                {cache.status === 'loading'
+                  ? 'Cache is still loading — try again in a moment.'
+                  : 'No upcoming registered competitions found.'}
               </div>
             )}
-
-            {compsError && <div style={S.warn}>{compsError}</div>}
-
-            {!compsLoading && !compsError && comps.length === 0 && (
-              <div style={S.empty}>No upcoming competitions found for this competitor.</div>
-            )}
-
-            {!compsLoading && comps.map(({ comp, wcifInfo }) => (
+            {comps.map(({ comp, wcifInfo }) => (
               <CompCard key={comp.id} comp={comp} wcifInfo={wcifInfo} />
             ))}
           </>
         )}
 
-        {/* Clear */}
+        {/* Action buttons */}
         {(persons.length > 0 || showComps) && (
           <button style={S.clearBtn} onClick={clearAll}>
             <TrashIcon />Clear / New Search
           </button>
         )}
+
+        {/* Refresh Cache button — always visible */}
+        <button style={S.refreshBtn(cacheLoading)} onClick={handleRefresh} disabled={cacheLoading}>
+          {cacheLoading ? <><Spinner size={14} color="#fff" /> Refreshing cache…</> : <><RefreshIcon /> Refresh Cache</>}
+        </button>
 
         <div style={S.footer}>
           WCA-CompTrack · by tankuoping@gmail.com<br />
