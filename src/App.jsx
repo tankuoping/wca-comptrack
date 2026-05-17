@@ -444,14 +444,17 @@ export default function App() {
 
       {/* Header */}
       <div style={S.header}>
-        <div>
+        <div style={{ flex: 1 }}>
           <div style={S.headerTitle}>WCA-CompTrack</div>
           <div style={S.headerSub}>UPCOMING · BY COMPETITOR</div>
         </div>
-        <a href="https://www.worldcubeassociation.org" target="_blank" rel="noopener noreferrer" style={S.logoWrap}>
-          <img src="https://assets.worldcubeassociation.org/assets/570b6bc/assets/WCA Logo-4ef000323c6a9a407cdf07647a31c0ef4dc847f2352a9a136ef3e809e95bdeab.svg"
-            alt="WCA" style={{ height: '28px', width: 'auto' }}
-            onError={e => { e.target.style.display = 'none' }} />
+        <a href="/subscribe" style={{
+          display: 'flex', alignItems: 'center', gap: '6px',
+          background: 'rgba(255,255,255,0.15)', borderRadius: '8px',
+          padding: '6px 12px', textDecoration: 'none', color: '#fff',
+          fontSize: '12px', fontWeight: 600,
+        }}>
+          🔔 Alerts
         </a>
       </div>
 
