@@ -494,6 +494,25 @@ export default function App() {
         </div>
         <div style={S.hint}>e.g. "luis tan" or "2023YILU01"</div>
 
+        {/* CompAlert promo card */}
+        <a href="/subscribe" style={{
+          display: 'flex', alignItems: 'center', gap: '12px',
+          background: 'linear-gradient(135deg, #e8f0fe 0%, #e0f2f1 100%)',
+          border: '1.5px solid #80cbc4', borderRadius: '10px',
+          padding: '10px 14px', marginBottom: '16px', textDecoration: 'none',
+        }}>
+          <div style={{ fontSize: '22px', flexShrink: 0 }}>🔔</div>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: '12px', fontWeight: 700, color: '#003f88' }}>
+              Get notified about new competitions
+            </div>
+            <div style={{ fontSize: '11px', color: '#00695c', marginTop: '2px' }}>
+              Subscribe to email alerts by country &amp; event → WCA CompAlert
+            </div>
+          </div>
+          <div style={{ fontSize: '16px', color: '#80cbc4', flexShrink: 0 }}>›</div>
+        </a>
+
         {error && <div style={S.warn}>{error}</div>}
 
         {/* Results */}
