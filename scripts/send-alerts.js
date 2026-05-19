@@ -135,7 +135,11 @@ async function main() {
   const currComps = Object.values(curr.wcifMap).map(d => d.comp)
   const prevIds = new Set(Object.keys(prev.wcifMap))
 
-  const newlyAnnounced = currComps.filter(c => !prevIds.has(c.id))
+  const now = new Date()
+  const newlyAnnounced = currComps.filter(c =>
+    !prevIds.has(c.id) &&
+    (!c.registration_close || new Date(c.registration_close) > now)
+  )
 
   const yesterday = new Date(today); yesterday.setDate(yesterday.getDate() - 1)
   const regJustOpened = currComps.filter(c => {

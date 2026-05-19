@@ -128,9 +128,14 @@ async function main() {
   const cache = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'))
   const allComps = Object.values(cache.wcifMap).map(d => d.comp)
 
-  // Only include comps that haven't started yet
+  // Only include comps that haven't ended AND registration hasn't closed yet
   const today = new Date().toISOString().split('T')[0]
-  const upcomingComps = allComps.filter(c => c.end_date >= today)
+  const now = new Date()
+  const upcomingComps = allComps.filter(c => {
+    if (c.end_date < today) return false  // comp already ended
+    if (c.registration_close && new Date(c.registration_close) < now) return false  // reg already closed
+    return true
+  })
 
   console.log(`Cache has ${allComps.length} comps, ${upcomingComps.length} still upcoming`)
 
