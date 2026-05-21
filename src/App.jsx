@@ -216,7 +216,7 @@ const S = {
   empty: { fontSize: '13px', color: '#888', padding: '12px 0' },
   compCard: {
     border: '1.5px solid #80cbc4', borderRadius: '10px',
-    marginBottom: '10px', display: 'flex', overflow: 'hidden',
+    marginBottom: '10px', overflow: 'hidden',
     background: '#fff',
   },
   dateBox: {
@@ -244,8 +244,9 @@ const S = {
     borderRadius: '4px', background: '#e0f2f1', color: '#004d40',
   },
   compRight: {
-    display: 'flex', flexDirection: 'column', alignItems: 'flex-end',
-    padding: '8px 10px', gap: '4px', minWidth: '110px',
+    display: 'flex', flexDirection: 'row', alignItems: 'center',
+    flexWrap: 'wrap', padding: '6px 10px 8px', gap: '6px',
+    borderTop: '1px solid #e0f2f1',
   },
   tagReg: {
     fontSize: '9px', fontWeight: 800, letterSpacing: '0.06em',
@@ -346,25 +347,29 @@ function CompCard({ comp, wcifInfo }) {
 
   return (
     <div style={S.compCard}>
-      <div style={S.dateBox}>
-        <div style={S.dateDay}>{day}</div>
-        <div style={S.dateMon}>{month}</div>
-        <div style={S.dateDow}>({dow})</div>
-        {firstTime && <div style={S.dateTime}>{firstTime}</div>}
-      </div>
-      <div style={S.compBody}>
-        <a href={wcaUrl} target="_blank" rel="noopener noreferrer" style={S.compNameLink}>{comp.name}</a>
-        <a href={mapsUrl} target="_blank" rel="noopener noreferrer" style={S.compLoc}>{locDisplay}</a>
-        <div style={S.pills}>
-          {eventIds.map(id => <span key={id} style={S.pill}>{EVENT_SHORT[id] || id}</span>)}
+      {/* Top row: date + info */}
+      <div style={{ display: 'flex', overflow: 'hidden' }}>
+        <div style={S.dateBox}>
+          <div style={S.dateDay}>{day}</div>
+          <div style={S.dateMon}>{month}</div>
+          <div style={S.dateDow}>({dow})</div>
+          {firstTime && <div style={S.dateTime}>{firstTime}</div>}
+        </div>
+        <div style={S.compBody}>
+          <a href={wcaUrl} target="_blank" rel="noopener noreferrer" style={S.compNameLink}>{comp.name}</a>
+          <a href={mapsUrl} target="_blank" rel="noopener noreferrer" style={S.compLoc}>{locDisplay}</a>
+          <div style={S.pills}>
+            {eventIds.map(id => <span key={id} style={S.pill}>{EVENT_SHORT[id] || id}</span>)}
+          </div>
         </div>
       </div>
+      {/* Bottom row: links */}
       <div style={S.compRight}>
         <span style={S.tagReg}>Registered</span>
-        <a href={groupsUrl} target="_blank" rel="noopener noreferrer" style={S.groupsLink}>competitiongroups ↗</a>
+        <a href={groupsUrl} target="_blank" rel="noopener noreferrer" style={S.groupsLink}>Groups ↗</a>
         {gcalUrl && (
           <a href={gcalUrl} target="_blank" rel="noopener noreferrer" style={S.gcalLink}>
-            <CalIcon />add to Google Cal
+            <CalIcon />Google Cal
           </a>
         )}
         {liveActive
