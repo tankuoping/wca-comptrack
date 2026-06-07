@@ -333,7 +333,7 @@ function CompCard({ comp, wcifInfo }) {
 
   const today = new Date().toISOString().split('T')[0]
   const liveActive = startDate <= today
-  const liveUrl = `https://live.worldcubeassociation.org/competitions/${comp.id}`
+  const liveUrl = `https://live.worldcubeassociation.org/link/competitions/${comp.id}`
   const groupsUrl = `https://www.competitiongroups.com/competitions/${comp.id}/psych-sheet`
   const wcaUrl = comp.url || `https://www.worldcubeassociation.org/competitions/${comp.id}`
   const gcalUrl = buildGCalUrl(comp.name, startDate, endDate, comp.venue || comp.city || '', wcaUrl)
